@@ -85,12 +85,18 @@ def generate_class1(n_numbers: int = 3, digits: int = 1) -> list:
                 new_val = current + v
                 if new_val < 0 or new_val > max_val:
                     continue
-                # Check every digit column independently
+                # Check every digit column independently.
+                # Use the isolated digit of v for that column — NOT d_new - d_cur,
+                # because d_new already has any carry baked in, which gives a
+                # wrong (smaller) delta and lets carry-producing moves slip through.
                 col_ok = True
                 for col in range(digits):
                     d_cur = (current // (10 ** col)) % 10
-                    d_new = (new_val // (10 ** col)) % 10
-                    if not _can_add_direct(d_cur, d_new - d_cur):
+                    # Isolated contribution of v to this column (sign-aware)
+                    col_delta = (abs(v) // (10 ** col)) % 10
+                    if v < 0:
+                        col_delta = -col_delta
+                    if not _can_add_direct(d_cur, col_delta):
                         col_ok = False
                         break
                 if col_ok:
@@ -106,10 +112,157 @@ def generate_class1(n_numbers: int = 3, digits: int = 1) -> list:
     return _fallback_sequence(n_numbers, digits)
 
 
+def _is_small_friend(current: int, v: int, digits: int) -> bool:
+    """
+    Return True if adding v to current requires a 5-complement in at least
+    one column AND does NOT require a 10-complement carry in any column.
+
+    A 5-complement move is one that:
+    - Cannot be done directly (would need to exchange the 5-bead with lower beads)
+    - Stays within 0-9 in every column (no carry to the next column)
+    """
+    new_val = current + v
+    if new_val < 0 or new_val > (10 ** digits - 1):
+        return False
+    needs_5comp = False
+    for col in range(digits):
+        d_cur = (current // (10 ** col)) % 10
+        col_delta = (abs(v) // (10 ** col)) % 10
+        if v < 0:
+            col_delta = -col_delta
+        raw = d_cur + col_delta
+        if raw < 0 or raw > 9:
+            return False   # 10-complement carry — not Class 2
+        if not _can_add_direct(d_cur, col_delta):
+            needs_5comp = True  # within 0-9 but not direct = 5-complement
+    return needs_5comp
+
+
+def _is_no_carry(current: int, v: int, digits: int) -> bool:
+    """
+    Return True if adding v to current stays within 0-9 in every column
+    (no 10-complement carry between columns). Both direct and small-friend
+    moves satisfy this — it's the Class 2 upper bound.
+    """
+    new_val = current + v
+    if new_val < 0 or new_val > (10 ** digits - 1):
+        return False
+    for col in range(digits):
+        d_cur = (current // (10 ** col)) % 10
+        col_delta = (abs(v) // (10 ** col)) % 10
+        if v < 0:
+            col_delta = -col_delta
+        if d_cur + col_delta < 0 or d_cur + col_delta > 9:
+            return False
+    return True
+
+
 def generate_class2(n_numbers: int = 3, digits: int = 1) -> list:
     """
-    Class 2: 5-complement (small friend) allowed.
-    Column sums stay 0-9 (no carry between columns / no 10-complement).
+    Class 2: 5-complement (small friend) moves.
+
+    Rules:
+    - No 10-complement carry between columns (each column stays 0-9).
+    - At least one step in the sequence MUST be a small-friend move
+      (requires 5-complement in at least one column).
+    - Small-friend candidates are strongly preferred over direct moves
+      so the sheet feels distinctly Class 2.
+
+    Strategy:
+    - For each step, collect small-friend candidates and direct candidates.
+    - Pick from small-friend pool with 80% probability if available,
+      otherwise fall back to direct.
+    - After building the sequence, reject it if no step used small-friend.
+    """
+    max_val = 10 ** digits - 1
+    for _ in range(8000):
+        first = random.randint(1, max_val)
+        nums = [first]
+        current = first
+        ok = True
+        has_small_friend = False
+
+        for _ in range(n_numbers - 1):
+            sf_candidates = []
+            direct_candidates = []
+
+            for v in range(-max_val, max_val + 1):
+                if v == 0:
+                    continue
+                if _is_small_friend(current, v, digits):
+                    sf_candidates.append(v)
+                elif _is_no_carry(current, v, digits) and not _is_small_friend(current, v, digits):
+                    # Pure direct move: no 5-complement, no 10-complement
+                    col_direct = True
+                    for col in range(digits):
+                        d_cur = (current // (10 ** col)) % 10
+                        col_delta = (abs(v) // (10 ** col)) % 10
+                        if v < 0:
+                            col_delta = -col_delta
+                        if not _can_add_direct(d_cur, col_delta):
+                            col_direct = False
+                            break
+                    if col_direct:
+                        direct_candidates.append(v)
+
+            if not sf_candidates and not direct_candidates:
+                ok = False
+                break
+
+            # 80% chance to pick small-friend if available
+            if sf_candidates and (not direct_candidates or random.random() < 0.80):
+                v = random.choice(sf_candidates)
+                has_small_friend = True
+            elif direct_candidates:
+                v = random.choice(direct_candidates)
+            else:
+                v = random.choice(sf_candidates)
+                has_small_friend = True
+
+            nums.append(v)
+            current += v
+
+        # Reject sequences with no small-friend step
+        if ok and has_small_friend and len(nums) == n_numbers:
+            return nums
+
+    return _fallback_sequence(n_numbers, digits)
+
+
+def _requires_ten_complement(current: int, v: int, digits: int) -> bool:
+    """
+    Return True if adding v to current requires a 10-complement carry/borrow
+    in at least one column.
+
+    A 10-complement carry/borrow occurs when a column's intermediate sum
+    goes below 0 (borrow) or reaches 10+ (carry) — i.e. the raw column
+    arithmetic without carry would overflow or underflow the 0-9 range.
+
+    For single-digit: simply check if the ones column overflows/underflows.
+    For multi-digit: check each column's isolated arithmetic.
+    """
+    for col in range(digits):
+        d_cur = (current // (10 ** col)) % 10
+        # Isolated delta for this column (ignoring carries from lower columns)
+        col_delta = (abs(v) // (10 ** col)) % 10
+        if v < 0:
+            col_delta = -col_delta
+        raw = d_cur + col_delta
+        # If raw goes outside 0-9, a 10-complement carry/borrow is needed
+        if raw < 0 or raw > 9:
+            return True
+    return False
+
+
+def generate_class3(n_numbers: int = 3, digits: int = 1) -> list:
+    """
+    Class 3: Big Friend (10-complement carry-overs) ONLY.
+
+    Every step in the sequence must require a 10-complement carry or borrow
+    in at least one column. Steps that can be solved purely with direct moves
+    or 5-complement (small friend) are excluded — those belong to Class 1/2.
+
+    Running sum stays in [0, 10^digits - 1].
     """
     max_val = 10 ** digits - 1
     for _ in range(8000):
@@ -119,57 +272,12 @@ def generate_class2(n_numbers: int = 3, digits: int = 1) -> list:
         ok = True
         for _ in range(n_numbers - 1):
             candidates = []
-            for v in range(-max_val, max_val + 1):
+            for v in range(-current, max_val - current + 1):
                 if v == 0:
                     continue
-                new_val = current + v
-                if new_val < 0 or new_val > max_val:
-                    continue
-                # No carry between columns: each column digit must stay 0-9
-                # without borrowing/carrying from adjacent column
-                col_ok = True
-                if digits > 1:
-                    for col in range(digits):
-                        d_cur = (current // (10 ** col)) % 10
-                        d_new = (new_val // (10 ** col)) % 10
-                        # Detect if this column required a carry/borrow
-                        # by checking if the digit change is consistent
-                        # with the actual arithmetic delta for that column
-                        col_delta = (v // (10 ** col)) % 10
-                        if v < 0:
-                            col_delta = -(((-v) // (10 ** col)) % 10)
-                        expected = d_cur + col_delta
-                        if expected != d_new:
-                            col_ok = False
-                            break
-                if col_ok:
+                # Must require a 10-complement carry/borrow in at least one column
+                if _requires_ten_complement(current, v, digits):
                     candidates.append(v)
-            if not candidates:
-                ok = False
-                break
-            v = random.choice(candidates)
-            nums.append(v)
-            current += v
-        if ok and len(nums) == n_numbers:
-            return nums
-    return _fallback_sequence(n_numbers, digits)
-
-
-def generate_class3(n_numbers: int = 3, digits: int = 1) -> list:
-    """
-    Class 3: Full addition/subtraction with 10-complement carry-overs.
-    Only constraint: running sum stays >= 0.
-    """
-    max_val = 10 ** digits - 1
-    for _ in range(8000):
-        first = random.randint(1, max_val)
-        nums = [first]
-        current = first
-        ok = True
-        for _ in range(n_numbers - 1):
-            lo = -current
-            hi = max_val - current
-            candidates = [v for v in range(lo, hi + 1) if v != 0]
             if not candidates:
                 ok = False
                 break
@@ -191,12 +299,29 @@ def _fallback_sequence(n: int, digits: int) -> list:
 
 
 def generate_sequence(class_num: int, n_numbers: int = 3, digits: int = 1) -> list:
-    if class_num == 1:
-        return generate_class1(n_numbers, digits)
-    elif class_num == 2:
-        return generate_class2(n_numbers, digits)
+    """
+    Generate a sequence of numbers for the given class and digit count.
+    digits=0 means 'mixed' — randomly pick 1 or 2 digits per call.
+
+    Special rule: Class 3 (big friend / 10-complement) requires at least
+    2 digits because a 10-complement carry must cross into the tens column.
+    If digits=1 is requested for Class 3, it is silently upgraded to 2.
+    """
+    if digits == 0:
+        effective_digits = random.choice([1, 2])
     else:
-        return generate_class3(n_numbers, digits)
+        effective_digits = digits
+
+    # Class 3 needs at least 2 digits for 10-complement to be possible
+    if class_num == 3 and effective_digits == 1:
+        effective_digits = 2
+
+    if class_num == 1:
+        return generate_class1(n_numbers, effective_digits)
+    elif class_num == 2:
+        return generate_class2(n_numbers, effective_digits)
+    else:
+        return generate_class3(n_numbers, effective_digits)
 
 
 # ============================================================
@@ -356,7 +481,11 @@ class AbacusPDF(FPDF):
 def build_pdf(class_num: int, digits: int) -> bytes:
     """
     Build the complete A4 practice sheet and return raw PDF bytes.
+    digits: 1 = 1-digit, 2 = 2-digit, 0 = mixed (1 and 2 digit problems)
     """
+    # For abacus rod drawing sections (1.2 / 1.3) we need a concrete rod count.
+    # Mixed mode uses 2-rod abacus diagrams so both digit widths are covered.
+    abacus_digits = 2 if digits == 0 else digits
     pdf = AbacusPDF(orientation="P", unit="mm", format="A4")
     pdf.add_page()
     pdf.set_auto_page_break(auto=False)
@@ -485,15 +614,15 @@ def build_pdf(class_num: int, digits: int) -> bytes:
     pdf.set_line_width(0.35)
 
     # ── 1.2: 3 empty abacus rods ───────────────────────────────
-    max_val = 10 ** digits - 1
-    nums_12 = [random.randint(10 if digits > 1 else 1, max_val) for _ in range(3)]
+    max_val = 10 ** abacus_digits - 1
+    nums_12 = [random.randint(10 if abacus_digits > 1 else 1, max_val) for _ in range(3)]
 
-    abacus_w = 22 if digits == 1 else 32   # width per abacus unit
+    abacus_w = 22 if abacus_digits == 1 else 32   # width per abacus unit
     spacing_12 = (DIVIDER_X - ML - 3 * abacus_w) / 4
 
     for i, num in enumerate(nums_12):
         ax = ML + spacing_12 + i * (abacus_w + spacing_12)
-        draw_full_abacus_empty(pdf, ax, ROD_AREA_Y, digits)
+        draw_full_abacus_empty(pdf, ax, ROD_AREA_Y, abacus_digits)
 
         # Circled number below rod
         circ_cx = ax + (abacus_w / 2)
@@ -506,7 +635,7 @@ def build_pdf(class_num: int, digits: int) -> bytes:
         pdf.cell(circ_rw, 6.5, str(num), align="C")
 
     # ── 1.3: 2 abacus rods with beads ──────────────────────────
-    nums_13 = [random.randint(10 if digits > 1 else 1, max_val) for _ in range(2)]
+    nums_13 = [random.randint(10 if abacus_digits > 1 else 1, max_val) for _ in range(2)]
 
     s13_left = DIVIDER_X + 8
     s13_right = PAGE_W - MR
@@ -515,7 +644,7 @@ def build_pdf(class_num: int, digits: int) -> bytes:
 
     for i, num in enumerate(nums_13):
         ax = s13_left + spacing_13 + i * (abacus_w + spacing_13)
-        draw_full_abacus_with_beads(pdf, ax, ROD_AREA_Y, num, digits)
+        draw_full_abacus_with_beads(pdf, ax, ROD_AREA_Y, num, abacus_digits)
 
         # Answer box below
         ans_y = ROD_AREA_Y + ROD_H + 4
@@ -641,32 +770,44 @@ def main():
             help=(
                 "**Class 1** – Direct sums only (no 5-complement, no carry)\n\n"
                 "**Class 2** – 5-complement (small friend) allowed; no column carry\n\n"
-                "**Class 3** – Full addition/subtraction with 10-complement carry"
+                "**Class 3** – 10-complement (big friend) carry only. "
+                "Requires 2-digit numbers; 1-digit selection is auto-upgraded."
             ),
         )
     with col2:
         digit_choice = st.selectbox(
             "Select Digits",
-            options=["1 Digit", "2 Digits"],
+            options=["1 Digit", "2 Digits", "Mixed (1 & 2 Digits)"],
+            help=(
+                "**1 Digit** – Problems use single-digit numbers (0–9)\n\n"
+                "**2 Digits** – Problems use two-digit numbers (10–99)\n\n"
+                "**Mixed** – Each problem randomly uses 1 or 2 digits"
+            ),
         )
 
     class_num = int(class_choice.split()[1])
-    digits    = int(digit_choice.split()[0])
+    # digits: 1, 2, or 0 (mixed)
+    if digit_choice.startswith("Mixed"):
+        digits = 0
+    else:
+        digits = int(digit_choice.split()[0])
 
     if st.button("📄 Generate & Download PDF", type="primary"):
         with st.spinner("Generating worksheet…"):
             pdf_bytes = build_pdf(class_num, digits)
 
         st.success("✅ PDF ready!")
+        digit_label = "mixed" if digits == 0 else f"{digits}digit"
         st.download_button(
             label="⬇️ Download Practice Sheet",
             data=pdf_bytes,
-            file_name=f"abacus_class{class_num}_{digits}digit.pdf",
+            file_name=f"abacus_class{class_num}_{digit_label}.pdf",
             mime="application/pdf",
         )
 
+        digit_display = "Mixed (1 & 2 Digits)" if digits == 0 else f"{digits} Digit{'s' if digits > 1 else ''}"
         st.info(
-            f"**Class {class_num} | {digits} Digit{'s' if digits > 1 else ''}**\n\n"
+            f"**Class {class_num} | {digit_display}**\n\n"
             "Sheet includes:\n"
             "- **1.1** Calculate Mentally — 5 problems × 3 numbers + answer box\n"
             "- **1.2** Draw the beads — 3 empty abacus rods with target number\n"
